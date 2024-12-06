@@ -1,0 +1,192 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import praw
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, accuracy_score, precision_score, recall_score, f1_score
+import joblib
+from datetime import datetime, timedelta
+from textblob import TextBlob
+
+# Step 1: Scrape Data from Reddit
+def scrape_reddit(subreddit_name, limit=100):
+    """
+    Scrapes posts from a specific Reddit subreddit and returns a DataFrame containing:
+    - title: Title of the Reddit post
+    - content: Content of the Reddit post
+    - upvotes: Number of upvotes for the post
+    - comments: Number of comments on the post
+    - created_utc: Timestamp of when the post was created (in UTC)
+
+    Parameters:
+    - subreddit_name: The name of the subreddit to scrape (e.g., "wallstreetbets").
+    - limit: The number of posts to scrape (default is 100).
+
+    Returns:
+    - A pandas DataFrame with scraped Reddit post data.
+    """
+    reddit = praw.Reddit(client_id="YOUR_CLIENT_ID",
+                         client_secret="YOUR_CLIENT_SECRET",
+                         user_agent="StockSentimentAnalysis")
+    subreddit = reddit.subreddit(subreddit_name)
+    posts = []
+    for submission in subreddit.new(limit=limit):
+        posts.append({
+            "title": submission.title,
+            "content": submission.selftext,
+            "upvotes": submission.score,
+            "comments": submission.num_comments,
+            "created_utc": submission.created_utc
+        })
+    return pd.DataFrame(posts)
+
+# Step 2: Fetch Stock Data
+def fetch_stock_data(ticker, start_date, end_date):
+    """
+    Fetches stock data for a given ticker symbol within the specified date range and calculates:
+    - Price_Change: The change in stock price from the previous day
+    - Movement: A binary value indicating whether the stock price went up (1) or down (0)
+
+    Parameters:
+    - ticker: The stock ticker symbol (e.g., "TSLA").
+    - start_date: The start date of the period to fetch data.
+    - end_date: The end date of the period to fetch data.
+
+    Returns:
+    - A pandas DataFrame containing the stock data with columns: Date, Close, Movement.
+    """
+    stock_data = yf.download(ticker, start=start_date, end=end_date)
+    stock_data['Price_Change'] = stock_data['Close'].diff().shift(-1)  # Price difference for the next day
+    stock_data['Movement'] = (stock_data['Price_Change'] > 0).astype(int)  # Define target: 1 for price increase
+    stock_data['Date'] = stock_data.index.date
+    return stock_data[['Date', 'Close', 'Movement']]
+
+# Step 3: Align Reddit Posts with Stock Data
+def align_data_with_stock(reddit_data, stock_data):
+    """
+    Merges the Reddit data with the stock data on the date to align posts with stock movements.
+
+    Parameters:
+    - reddit_data: DataFrame containing Reddit posts.
+    - stock_data: DataFrame containing stock data (date, close price, and movement).
+
+    Returns:
+    - A merged DataFrame with aligned Reddit posts and stock movements.
+    """
+    reddit_data['Date'] = pd.to_datetime(reddit_data['created_utc'], unit='s').dt.date
+    merged_data = pd.merge(reddit_data, stock_data, on='Date', how='inner')
+    return merged_data
+
+# Step 4: Preprocess Data
+def preprocess_data_with_stock(df, ticker_list):
+    """
+    Preprocesses the data by:
+    - Cleaning the content (filling missing values).
+    - Performing sentiment analysis on the post content.
+    - Counting the number of stock mentions in the text.
+    - Creating features related to time (hour of post and trading hours).
+
+    Parameters:
+    - df: The DataFrame containing the merged Reddit and stock data.
+    - ticker_list: A list of stock tickers to check for mentions in Reddit posts.
+
+    Returns:
+    - A DataFrame with relevant features for the prediction model.
+    """
+    df['content'] = df['content'].fillna("")
+    df['text'] = df['title'] + " " + df['content']
+    df['sentiment'] = df['text'].apply(lambda x: TextBlob(x).sentiment.polarity)
+    df['stock_mentions'] = df['text'].apply(lambda x: len([ticker for ticker in ticker_list if ticker in x]))
+    df['hour'] = pd.to_datetime(df['created_utc'], unit='s').dt.hour
+    df['is_trading_hours'] = df['hour'].between(9, 16).astype(int)
+    return df[['text', 'sentiment', 'upvotes', 'comments', 'stock_mentions', 'is_trading_hours', 'Movement']]
+
+# Step 5: Train Machine Learning Model
+def train_model(df):
+    """
+    Trains a RandomForestClassifier on the provided features and evaluates its performance.
+
+    Parameters:
+    - df: The DataFrame containing the preprocessed data with features and target.
+
+    Returns:
+    - The trained RandomForest model.
+    """
+    features = ['sentiment', 'upvotes', 'comments', 'stock_mentions', 'is_trading_hours']
+    X = df[features]
+    y = df['Movement']
+
+    # Split into training and testing sets
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    # Train Random Forest Classifier
+    model = RandomForestClassifier(random_state=42)
+    model.fit(X_train, y_train)
+
+    # Make Predictions
+    y_pred = model.predict(X_test)
+
+    # Evaluate Model
+    print("\nModel Evaluation Metrics:")
+    print(f"Accuracy: {accuracy_score(y_test, y_pred):.2f}")
+    print(f"Precision: {precision_score(y_test, y_pred):.2f}")
+    print(f"Recall: {recall_score(y_test, y_pred):.2f}")
+    print(f"F1 Score: {f1_score(y_test, y_pred):.2f}")
+    print("\nClassification Report:")
+    print(classification_report(y_test, y_pred))
+
+    return model
+
+# Step 6: Save the Model
+def save_model(model, filename="stock_movement_model.pkl"):
+    """
+    Saves the trained model to a file using joblib.
+
+    Parameters:
+    - model: The trained machine learning model.
+    - filename: The name of the file to save the model (default: "stock_movement_model.pkl").
+    """
+    joblib.dump(model, filename)
+
+# Step 7: Main Execution
+if __name__ == "__main__":
+    """
+    Main function to execute the stock movement prediction pipeline. It:
+    - Scrapes Reddit posts related to stock discussions.
+    - Fetches historical stock data.
+    - Aligns Reddit posts with stock data.
+    - Preprocesses the data and extracts features.
+    - Trains a machine learning model to predict stock movement.
+    - Saves the trained model for future use.
+    """
+    # Define stock ticker list (example)
+    ticker_list = ["AAPL", "TSLA", "AMZN", "GOOGL", "MSFT"]
+
+    # Scrape Reddit data
+    print("Scraping Reddit data...")
+    reddit_data = scrape_reddit("wallstreetbets", limit=100)
+
+    # Fetch stock data
+    print("Fetching stock data...")
+    start_date = (datetime.utcnow() - timedelta(days=30)).strftime('%Y-%m-%d')
+    end_date = datetime.utcnow().strftime('%Y-%m-%d')
+    stock_data = fetch_stock_data("TSLA", start_date, end_date)
+
+    # Align Reddit data with stock data
+    print("Aligning data...")
+    aligned_data = align_data_with_stock(reddit_data, stock_data)
+
+    # Preprocess data with stock features
+    print("Preprocessing data...")
+    processed_data = preprocess_data_with_stock(aligned_data, ticker_list)
+
+    # Train the model
+    print("Training model...")
+    model = train_model(processed_data)
+
+    # Save the model
+    print("Saving model...")
+    save_model(model)
+
+    print("Process completed successfully!")
